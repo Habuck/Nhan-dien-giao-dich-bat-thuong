@@ -3,6 +3,10 @@ from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
 import bcrypt, jwt, joblib, numpy as np
 from sklearn.neighbors import NearestNeighbors
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import accuracy_score, classification_report
+from feature_engine import FeaturePipeline, extract_features, engineer_features, FEATURE_NAMES
 
 D = os.path.dirname(os.path.abspath(__file__))
 DB = os.path.join(D, "fraud_detection.db")
@@ -12,6 +16,7 @@ SK = os.environ.get("SECRET_KEY", "fraud-detection-secret-key")
 app = Flask(__name__, static_folder=ST, static_url_path="/static")
 CORS(app)
 ml = joblib.load(os.path.join(D, "fraud_model.pkl"))
+pipeline = FeaturePipeline(D)
 
 def db():
     c = sqlite3.connect(DB); c.row_factory = sqlite3.Row; return c
@@ -26,6 +31,11 @@ def init():
     if not d.execute("SELECT 1 FROM users WHERE username='admin'").fetchone():
         d.execute("INSERT INTO users(username,password_hash,role)VALUES(?,?,?)",("admin",bcrypt.hashpw(b"1234",bcrypt.gensalt()).decode(),"admin"))
         print("[+] admin/1234 created")
+    # Migration: add raw_features and label columns
+    try: d.execute("ALTER TABLE transactions ADD COLUMN raw_features TEXT")
+    except: pass
+    try: d.execute("ALTER TABLE transactions ADD COLUMN label INTEGER")
+    except: pass
     d.commit(); d.close()
 
 hp = lambda pw: bcrypt.hashpw(pw.encode(), bcrypt.gensalt()).decode()
@@ -43,30 +53,47 @@ def auth(f):
         return f(*a, **k)
     return w
 
+def _knn_load(uid):
+    p = os.path.join(D, f"knn_{uid}.pkl")
+    return joblib.load(p) if os.path.exists(p) else None
+
+def _knn_save(uid, state):
+    joblib.dump(state, os.path.join(D, f"knn_{uid}.pkl"))
+
 def _knn_anomaly_check(uid, amt):
-    d = db()
-    rows = d.execute("SELECT amount FROM transactions WHERE user_id=? ORDER BY created_at DESC LIMIT 100",(uid,)).fetchall()
-    d.close()
-    if len(rows) < 10: return False, 0.0
-    amounts = np.array([r["amount"] for r in rows]).reshape(-1, 1)
-    knn = NearestNeighbors(n_neighbors=min(5, len(amounts)))
-    knn.fit(amounts)
+    state = _knn_load(uid)
+    if state is not None:
+        amounts, knn = state["amounts"], state["knn"]
+    else:
+        d = db()
+        rows = d.execute("SELECT amount FROM transactions WHERE user_id=? ORDER BY created_at DESC LIMIT 100",(uid,)).fetchall()
+        d.close()
+        if len(rows) < 10: return False, 0.0
+        amounts = np.array([r["amount"] for r in rows])
+        knn = NearestNeighbors(n_neighbors=min(5, len(amounts)))
+        knn.fit(amounts.reshape(-1, 1))
     dist, _ = knn.kneighbors([[amt]])
     avg_dist = np.mean(dist)
     threshold = np.percentile(amounts, 95) * 2
     is_anomaly = amt > threshold or avg_dist > np.std(amounts) * 3
     anomaly_score = min(avg_dist / (np.std(amounts) + 1e-6), 1.0)
+    # Update KNN state with new data point
+    amounts = np.append(amounts, amt)[-100:]
+    knn_new = NearestNeighbors(n_neighbors=min(5, len(amounts)))
+    knn_new.fit(amounts.reshape(-1, 1))
+    _knn_save(uid, {"amounts": amounts, "knn": knn_new})
     return is_anomaly, float(anomaly_score)
 
-def _predict(feats, uid, amt=None):
-    arr = np.array(feats, dtype=float).reshape(1,-1)
+def _predict(model_input, uid, amt=None, raw_features_json=None):
+    arr = np.array(model_input, dtype=float).reshape(1,-1)
     pred, prob = int(ml.predict(arr)[0]), float(ml.predict_proba(arr)[0][1])
     fraud = bool(pred == 1)
     if amt is None: amt = round(random.uniform(50000, 500000000))
     is_anomaly, anomaly_score = _knn_anomaly_check(uid, amt)
     d = db()
-    cur = d.execute("INSERT INTO transactions(user_id,features,prediction,probability,is_fraud,amount)VALUES(?,?,?,?,?,?)",
-                    (uid, json.dumps(feats), pred, prob, int(fraud), amt))
+    feats_json = json.dumps(model_input.tolist() if hasattr(model_input, "tolist") else model_input)
+    cur = d.execute("INSERT INTO transactions(user_id,features,prediction,probability,is_fraud,amount,raw_features)VALUES(?,?,?,?,?,?,?)",
+                    (uid, feats_json, pred, prob, int(fraud), amt, raw_features_json))
     tid = cur.lastrowid
     if fraud:
         d.execute("INSERT INTO alerts(transaction_id,alert_type,message)VALUES(?,?,?)",
@@ -100,10 +127,24 @@ def login():
 @app.route("/api/predict", methods=["POST"])
 @auth
 def predict():
-    feats = request.get_json().get("features",[])
-    if len(feats)!=30: return jsonify({"error":"Need 30 features"}),400
-    try: return jsonify(_predict(feats, request.user["user_id"], request.get_json().get("amount")))
-    except: return jsonify({"error":"Invalid features"}),400
+    data = request.get_json()
+    feats = data.get("features", [])
+    amt = data.get("amount")
+    if isinstance(feats, dict):
+        # New format: meaningful features dict
+        raw_feats = extract_features(feats)
+        model_input = pipeline.transform(raw_feats)
+        if amt is None: amt = float(feats.get("amount", round(random.uniform(50000, 500000000))))
+        raw_features_json = json.dumps(feats)
+    elif isinstance(feats, list) and len(feats) == 30:
+        # Old format: 30 raw features (backward compatible)
+        model_input = np.array(feats, dtype=float)
+        raw_features_json = None
+        if amt is None: amt = round(random.uniform(50000, 500000000))
+    else:
+        return jsonify({"error":"Need 30 features (list) or meaningful feature dict. Keys: " + ",".join(FEATURE_NAMES)}),400
+    try: return jsonify(_predict(model_input, request.user["user_id"], amt, raw_features_json))
+    except Exception as e: return jsonify({"error":f"Invalid features: {e}"}),400
 
 @app.route("/api/predict/batch", methods=["POST"])
 @auth
@@ -113,8 +154,20 @@ def predict_batch():
     res = []
     for t in txns:
         f = t.get("features",[])
-        if len(f)!=30: res.append({"error":"Invalid feature count"}); continue
-        res.append(_predict(f, request.user["user_id"], t.get("amount")))
+        amt = t.get("amount")
+        if isinstance(f, dict):
+            raw_feats = extract_features(f)
+            model_input = pipeline.transform(raw_feats)
+            if amt is None: amt = float(f.get("amount", round(random.uniform(50000, 500000000))))
+            raw_features_json = json.dumps(f)
+        elif isinstance(f, list) and len(f) == 30:
+            model_input = np.array(f, dtype=float)
+            raw_features_json = None
+            if amt is None: amt = round(random.uniform(50000, 500000000))
+        else:
+            res.append({"error":"Invalid feature format"}); continue
+        try: res.append(_predict(model_input, request.user["user_id"], amt, raw_features_json))
+        except: res.append({"error":"Prediction failed"})
     return jsonify({"results":res})
 
 @app.route("/api/transactions", methods=["GET"])
@@ -157,8 +210,77 @@ def resolve(aid):
     d = db(); d.execute("UPDATE alerts SET is_resolved=1 WHERE id=?",(aid,)); d.commit(); d.close()
     return jsonify({"message":"Resolved"})
 
+@app.route("/api/model/status", methods=["GET"])
+@auth
+def model_status():
+    d = db()
+    total = d.execute("SELECT COUNT(*)as c FROM transactions WHERE raw_features IS NOT NULL").fetchone()["c"]
+    labeled = d.execute("SELECT COUNT(*)as c FROM transactions WHERE label IS NOT NULL").fetchone()["c"]
+    fraud = d.execute("SELECT COUNT(*)as c FROM transactions WHERE is_fraud=1").fetchone()["c"]
+    d.close()
+    return jsonify({
+        "model_type": type(ml).__name__, "has_scaler": pipeline.is_fitted,
+        "transactions_with_features": total, "manually_labeled": labeled,
+        "fraud_samples": fraud, "can_retrain": total >= 50 and fraud > 0 and (total - fraud) > 0,
+        "knn_persisted": len([f for f in os.listdir(D) if f.startswith("knn_") and f.endswith(".pkl")])
+    })
+
+@app.route("/api/model/retrain", methods=["POST"])
+@auth
+def retrain():
+    if request.user.get("role") != "admin":
+        return jsonify({"error":"Admin only"}),403
+    d = db()
+    rows = d.execute("SELECT raw_features, COALESCE(label, is_fraud) as lbl FROM transactions WHERE raw_features IS NOT NULL").fetchall()
+    d.close()
+    if len(rows) < 50:
+        return jsonify({"error":f"Need at least 50 transactions with features, have {len(rows)}"}),400
+    X_raw, y = [], []
+    for r in rows:
+        try:
+            feats = json.loads(r["raw_features"])
+            X_raw.append(extract_features(feats))
+            y.append(int(r["lbl"]))
+        except: continue
+    if len(set(y)) < 2:
+        return jsonify({"error":"Need both fraud and non-fraud samples to retrain"}),400
+    X_eng = np.array([engineer_features(r) for r in X_raw])
+    y = np.array(y)
+    # Fit scaler on all engineered features
+    pipeline.fit_scaler(X_eng)
+    X_scaled = pipeline.scaler.transform(X_eng)
+    # Train/test split
+    X_train, X_test, y_train, y_test = train_test_split(X_scaled, y, test_size=0.2, random_state=42)
+    new_model = RandomForestClassifier(n_estimators=100, class_weight="balanced", random_state=42)
+    new_model.fit(X_train, y_train)
+    pred = new_model.predict(X_test)
+    acc = float(accuracy_score(y_test, pred))
+    # Save and reload
+    model_path = os.path.join(D, "fraud_model.pkl")
+    joblib.dump(new_model, model_path)
+    global ml; ml = new_model
+    fraud_count = int(np.sum(y == 1))
+    print(f"[+] Model retrained: {len(y)} samples ({fraud_count} fraud), accuracy={acc:.4f}")
+    return jsonify({
+        "message":"Model retrained successfully", "samples":len(y),
+        "fraud_samples":fraud_count, "safe_samples":len(y)-fraud_count,
+        "accuracy":round(acc,4)
+    })
+
+@app.route("/api/transactions/<int:tid>/label", methods=["PUT"])
+@auth
+def label_transaction(tid):
+    j = request.get_json()
+    label = j.get("label")
+    if label not in [0, 1]:
+        return jsonify({"error":"Label must be 0 (safe) or 1 (fraud)"}),400
+    d = db()
+    d.execute("UPDATE transactions SET label=? WHERE id=?",(label, tid))
+    d.commit(); d.close()
+    return jsonify({"message":"Label updated","transaction_id":tid,"label":label})
+
 @app.route("/api/health")
-def health(): return jsonify({"status":"ok","model":ml is not None})
+def health(): return jsonify({"status":"ok","model":ml is not None,"scaler":pipeline.is_fitted})
 
 @app.route("/")
 def root(): return send_from_directory(ST,"index.html")
